@@ -13,17 +13,31 @@
 # limitations under the License.
 """This module implements HTTP request handlers for the user views."""
 
+from flask import abort
 from flask import Blueprint
 from flask import current_app
 from flask import redirect
 from flask import render_template
 from flask import request
+from flask import session
 from flask import url_for
 from flask_login import current_user
 from flask_login import login_user
 from flask_login import logout_user
 
+from timesketch.lib.definitions import HTTP_STATUS_CODE_UNAUTHORIZED
+from timesketch.lib.definitions import HTTP_STATUS_CODE_BAD_REQUEST
 from timesketch.lib.forms import UsernamePasswordForm
+from timesketch.lib.google_auth import get_public_key_for_jwt
+from timesketch.lib.google_auth import get_oauth2_discovery_document
+from timesketch.lib.google_auth import get_oauth2_authorize_url
+from timesketch.lib.google_auth import get_encoded_jwt_over_https
+from timesketch.lib.google_auth import validate_jwt
+from timesketch.lib.google_auth import JwtValidationError
+from timesketch.lib.google_auth import JwtKeyError
+from timesketch.lib.google_auth import JwtFetchError
+from timesketch.lib.google_auth import DiscoveryDocumentError
+from timesketch.lib.google_auth import CSRF_KEY
 from timesketch.models import db_session
 from timesketch.models.user import Group
 from timesketch.models.user import User
@@ -36,18 +50,43 @@ auth_views = Blueprint(u'user_views', __name__)
 def login():
     """Handler for the login page view.
 
-    There are two ways of authentication.
-    1) If Single Sign On (SSO) is enabled in configuration and the environment
-       variable is present, e.g. REMOTE_USER then the system will get or create
-       the user object and setup a session for the user.
-    2) Local authentication is used if SSO login is not enabled. This will
+    There are three ways of authentication.
+    1) Google Cloud Identity-Aware Proxy.
+    2) If Single Sign On (SSO) is enabled in the configuration and the
+       environment variable is present, e.g. REMOTE_USER then the system will
+       get or create the user object and setup a session for the user.
+    3) Local authentication is used if SSO login is not enabled. This will
        authenticate the user against the local user database.
 
     Returns:
         Redirect if authentication is successful or template with context
         otherwise.
     """
-    form = UsernamePasswordForm()
+    # Google OpenID Connect authentication.
+    if current_app.config.get(u'GOOGLE_OIDC_ENABLED', False):
+        hosted_domain = current_app.config.get(u'GOOGLE_OIDC_HOSTED_DOMAIN')
+        return redirect(get_oauth2_authorize_url(hosted_domain))
+
+    # Google Identity-Aware Proxy authentication (using JSON Web Tokens)
+    if current_app.config.get(u'GOOGLE_IAP_ENABLED', False):
+        encoded_jwt = request.environ.get(
+            u'HTTP_X_GOOG_IAP_JWT_ASSERTION', None)
+        if encoded_jwt:
+            expected_audience = current_app.config.get(u'GOOGLE_IAP_AUDIENCE')
+            expected_issuer = current_app.config.get(u'GOOGLE_IAP_ISSUER')
+            algorithm = current_app.config.get(u'GOOGLE_IAP_ALGORITHM')
+            url = current_app.config.get(u'GOOGLE_IAP_PUBLIC_KEY_URL')
+            try:
+                public_key = get_public_key_for_jwt(encoded_jwt, url)
+                validated_jwt = validate_jwt(
+                    encoded_jwt, public_key, algorithm, expected_audience,
+                    expected_issuer)
+                email = validated_jwt.get(u'email')
+                if email:
+                    user = User.get_or_create(username=email, name=email)
+                    login_user(user)
+            except (JwtValidationError, JwtKeyError, Exception) as e:
+                current_app.logger.error('{}'.format(e))
 
     # SSO login based on environment variable, e.g. REMOTE_USER.
     if current_app.config.get(u'SSO_ENABLED', False):
@@ -86,12 +125,14 @@ def login():
             db_session.commit()
 
     # Login form POST
+    form = UsernamePasswordForm()
     if form.validate_on_submit:
         user = User.query.filter_by(username=form.username.data).first()
         if user:
             if user.check_password(plaintext=form.password.data):
                 login_user(user)
 
+    # Log the user in and setup the session.
     if current_user.is_authenticated:
         return redirect(request.args.get(u'next') or u'/')
 
@@ -107,3 +148,71 @@ def logout():
     """
     logout_user()
     return redirect(url_for(u'user_views.login'))
+
+
+@auth_views.route(u'/login/google_openid_connect/', methods=[u'GET'])
+def google_openid_connect():
+    """Handler for the Google OpenID Connect callback.
+
+    Reference:
+    https://developers.google.com/identity/protocols/OpenIDConnect
+
+    Returns:
+        Redirect response.
+    """
+    error = request.args.get(u'error', None)
+
+    if error:
+        current_app.logger.error(u'OAuth2 flow error: {}'.format(error))
+        return abort(HTTP_STATUS_CODE_BAD_REQUEST)
+
+    try:
+        code = request.args[u'code']
+        client_csrf_token = request.args.get(u'state')
+        server_csrf_token = session[CSRF_KEY]
+    except KeyError:
+        return abort(HTTP_STATUS_CODE_BAD_REQUEST)
+
+    if client_csrf_token != server_csrf_token:
+        return abort(HTTP_STATUS_CODE_BAD_REQUEST, u'Invalid CSRF token')
+
+    try:
+        encoded_jwt = get_encoded_jwt_over_https(code)
+    except JwtFetchError:
+        return abort(HTTP_STATUS_CODE_BAD_REQUEST)
+
+    try:
+        discovery_document = get_oauth2_discovery_document()
+    except DiscoveryDocumentError:
+        return abort(HTTP_STATUS_CODE_BAD_REQUEST)
+
+    algorithm = discovery_document[u'id_token_signing_alg_values_supported'][0]
+    expected_audience = current_app.config.get(u'GOOGLE_OIDC_CLIENT_ID')
+    expected_domain = current_app.config.get(u'GOOGLE_OIDC_HOSTED_DOMAIN')
+    expected_issuer = discovery_document[u'issuer']
+
+    # Fetch the public key and try to validate the JWT.
+    try:
+        public_key = get_public_key_for_jwt(
+            encoded_jwt, discovery_document[u'jwks_uri'])
+        validated_jwt = validate_jwt(
+            encoded_jwt, public_key, algorithm, expected_audience,
+            expected_issuer, expected_domain)
+    except (JwtValidationError, JwtKeyError) as e:
+        current_app.logger.error(u'{}'.format(e))
+        return abort(HTTP_STATUS_CODE_UNAUTHORIZED)
+
+    validated_email = validated_jwt.get(u'email')
+    user_whitelist = current_app.config.get(u'GOOGLE_OIDC_USER_WHITELIST')
+
+    # Check if the authenticating user is on the whitelist.
+    if user_whitelist:
+        if validated_email not in user_whitelist:
+            return abort(HTTP_STATUS_CODE_UNAUTHORIZED)
+
+    user = User.get_or_create(username=validated_email, name=validated_email)
+    login_user(user)
+
+    # Log the user in and setup the session.
+    if current_user.is_authenticated:
+        return redirect(request.args.get(u'next') or u'/')

@@ -42,3 +42,7 @@ The timesketch docker config is set to write all data to the host filesystem, no
 - redis: /var/lib/redis
 
 These locations on the host filesystem can be backed with any storage mechanism to persist sketch data beyond the container lifetimes.
+
+
+
+
